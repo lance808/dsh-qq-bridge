@@ -1,0 +1,15 @@
+# 依赖
+node_modules/
+
+# 运行期产物
+*.log
+*.tmp
+
+# 本机配置（真填了 bridgeToken / admins 的版本绝不能进仓库）
+config.local.*
+
+# 编辑器与系统杂项
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
