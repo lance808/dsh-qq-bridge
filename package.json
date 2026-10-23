@@ -1,6 +1,6 @@
 {
   "name": "dsh-qq-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "把 DSH 的工具审批与会话控制暴露到 QQ：审批请求推到 QQ 由管理员决定，QQ 指令反过来让 DSH 干活。",
   "type": "module",
   "main": "./lib/index.js",
@@ -32,7 +32,8 @@
     }
   },
   "scripts": {
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "link-deps": "node scripts/link-deps.mjs"
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.1"

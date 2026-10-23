@@ -20,6 +20,10 @@ import {
   parseAdmins,
   isAdmin,
   unreachableOutcome,
+  desktopApprovalDecision,
+  bridgeApprovalDecision,
+  desktopAnswerDecision,
+  bridgeAnswerDecision,
 } from '../lib/logic.js';
 
 // index.js 顶部要 import schemastery（只存在于 DSH profile），
@@ -251,6 +255,120 @@ test('★ relay/admins 不能从闭包旧值读，要走 live 对象', async () 
   );
 });
 
+/* -------------------------------------------------- 双通道判定（纯逻辑） */
+
+test('★ 桌面端 unavailable 不算决定（否则 QQ 还没推就被判"没人答"）', () => {
+  // 这是双通道最关键的判定：没有浏览器时 next() 会立刻返回 unavailable，
+  // 如果把它当决定，QQ 那条审批根本不会发出去。
+  assert.equal(desktopApprovalDecision('unavailable'), null);
+  assert.equal(desktopApprovalDecision(undefined), null);
+  assert.equal(desktopApprovalDecision(null), null);
+  assert.equal(desktopApprovalDecision('allowed-once'), 'allowed-once');
+  assert.equal(desktopApprovalDecision('rejected'), 'rejected');
+  assert.equal(desktopApprovalDecision('cancelled'), 'cancelled');
+});
+
+test('★ 桥的 timeout 不是拒绝，withdrawn 不是回答', () => {
+  assert.equal(bridgeApprovalDecision({ ok: true, status: 'timeout' }), null);
+  assert.equal(bridgeApprovalDecision({ ok: true, status: 'withdrawn' }), null);
+  assert.equal(bridgeApprovalDecision({ ok: true, status: 'unknown' }), null);
+  assert.equal(bridgeApprovalDecision({ ok: false }), null);
+  assert.equal(
+    bridgeApprovalDecision({ ok: true, status: 'answered', outcome: 'rejected' }),
+    'rejected',
+  );
+  // cancelled 是"问题被撤回"，要收场，不能继续等
+  assert.equal(bridgeApprovalDecision({ ok: true, status: 'cancelled' }), 'cancelled');
+  // 词表外的结论一律不认
+  assert.equal(
+    bridgeApprovalDecision({ ok: true, status: 'answered', outcome: '随便放行' }),
+    null,
+  );
+});
+
+test('提问答案的空值与对象必须区分', () => {
+  assert.equal(desktopAnswerDecision(undefined), null);
+  assert.equal(desktopAnswerDecision(null), null);
+  assert.deepEqual(desktopAnswerDecision({ answers: [] }), { answers: [] });
+
+  assert.equal(bridgeAnswerDecision({ ok: true, status: 'answered', kind: 'question', answer: null }), null);
+  assert.equal(bridgeAnswerDecision({ ok: true, status: 'timeout' }), null);
+  assert.deepEqual(
+    bridgeAnswerDecision({ ok: true, status: 'answered', kind: 'question', answer: { answers: [1] } }),
+    { answers: [1] },
+  );
+});
+
+test('★ 审批处理器必须先调 next() 再推 QQ（面板不能消失）', () => {
+  const src = readSource();
+  const i = src.indexOf("ctx.on('approval/request'");
+  assert.ok(i > 0, '找不到审批处理器');
+  const block = src.slice(i, i + 5200);
+  assert.match(block, /desktop: \(\) => next\(\)/, '必须先调 next()，让桌面审批面板出现');
+  assert.match(block, /prepend: true/, '要以 prepend 注册，排在浏览器 forwarder 之前');
+  assert.match(block, /withdraw/, '桌面先答要撤销 QQ 那条');
+  assert.match(block, /bridgeApprovalDecision/, '结论判定要用纯函数');
+});
+
+test('★ 地址未定时能靠发现文件补上（DSH 先启动的场景）', { skip: !BridgeClient ? '本机没有 DSH 的 schemastery 依赖' : false }, async () => {
+  // 两个程序谁先起不确定。DSH 先起时发现文件还不存在，
+  // 如果只在 apply 时读一次，之后永远补不上——表现是"两边都开着就是不推"。
+  //
+  // ## 这个测试不能依赖本机状态
+  //
+  // 早先它直接断言 `b.enabled === false`，隐含假设"本机没有发现文件"。
+  // 但只要开发机上 Ling-bot 正好开着（它就会写这个文件），
+  // 断言立刻失败——测试红的是环境，不是代码。
+  //
+  // 所以这里**临时把发现文件挪开**，用完还原：测"没有发现文件时安静返回 false"
+  // 这条分支，就必须真的制造出"没有"这个前提。
+  const { DISCOVERY_FILE } = await import('../lib/discovery.js');
+  const fsp = await import('node:fs/promises');
+  const backup = `${DISCOVERY_FILE}.test-bak`;
+
+  let had = false;
+  try {
+    await fsp.rename(DISCOVERY_FILE, backup);
+    had = true;
+  } catch {
+    /* 本来就没有，正好 */
+  }
+
+  try {
+    const b = new BridgeClient({ url: '', token: 't' });
+    assert.equal(b.enabled, false, '一开始没地址');
+
+    // 没有发现文件时 discover 应该安静返回 false
+    const first = b.discover();
+    assert.equal(typeof first, 'boolean');
+    assert.equal(first, false, '没有发现文件时不应发现成功');
+    assert.equal(b.enabled, false);
+  } finally {
+    if (had) await fsp.rename(backup, DISCOVERY_FILE).catch(() => {});
+  }
+});
+
+test('★ 没有令牌时 discover 不去猜地址', { skip: !BridgeClient ? '本机没有 DSH 的 schemastery 依赖' : false }, () => {
+  const b = new BridgeClient({ url: '', token: '' });
+  assert.equal(b.discover(), false);
+  assert.equal(b.enabled, false);
+});
+
+test('★ 审批处理器在使用桥之前会补一次地址发现', () => {
+  const src = readSource();
+  const i = src.indexOf("ctx.on('approval/request'");
+  const block = src.slice(i, i + 1200);
+  assert.match(block, /bridge\.discover\(\)/, '要用之前补一次，不能只靠 apply 那次');
+  assert.match(block, /if \(!bridge\.enabled\)/, '补不到就走桌面端');
+});
+
+test('★ 指令轮询也会补地址（Ling-bot 后启动时自动接上）', () => {
+  const src = readSource();
+  const i = src.indexOf('function startCommandPoller');
+  const block = src.slice(i, i + 900);
+  assert.match(block, /bridge\.discover\(\)/, '轮询要能自己接上');
+});
+
 /* -------------------------------------------------- 提问转推 */
 
 test('★ 要接管 user-questions/request', async () => {
@@ -261,22 +379,123 @@ test('★ 要接管 user-questions/request', async () => {
 test('★ 提问没有选项时要交还界面，不能硬转', async () => {
   // 纯自由输入的问题在 QQ 端没有编号可回，硬转只会让人无从下手。
   const src = readSource();
-  const i = src.indexOf("user-questions/request");
-  const block = src.slice(i, i + 1800);
+  const i = src.indexOf("ctx.on('user-questions/request'");
+  const block = src.slice(i, i + 2600);
   assert.match(block, /hasOptions/, '要检查有没有选项');
   assert.match(block, /return answer\(\)/, '没选项要交还界面');
 });
 
 test('★ 提问失败必须交还界面，不能把 DSH 卡死', async () => {
   const src = readSource();
-  const i = src.indexOf("user-questions/request");
-  const block = src.slice(i, i + 1800);
-  assert.match(block, /catch[\s\S]{0,200}answer\(\)/, '异常路径也要交还界面');
+  const i = src.indexOf("ctx.on('user-questions/request'");
+  const block = src.slice(i, i + 3200);
+  assert.match(block, /catch[\s\S]{0,300}answer\(\)/, '异常路径也要交还界面');
 });
 
-test('★ 答案为空时交还界面（不能当成"用户选了默认项"）', async () => {
+test('★ 两边都没答案时交还桌面结果（不能把 null 当成默认项）', async () => {
   const src = readSource();
-  const i = src.indexOf("user-questions/request");
-  const block = src.slice(i, i + 1800);
-  assert.match(block, /if \(!res\.answer\)/, 'null 要和"有答案"区分开');
+  const i = src.indexOf("ctx.on('user-questions/request'");
+  const block = src.slice(i, i + 3200);
+  assert.match(block, /return desktopValue/, '没有答案要把桌面端的返回值交回去');
+  assert.equal(/if \(!res\.answer\)/.test(block), false, '新协议没有 res 这个变量');
+});
+
+/* -------------------------------------------------- v2 两段式客户端 */
+
+test('★ v2：askStart 拿编号，awaitResult 等结论', { skip: !BridgeClient ? '本机没有 DSH 的 schemastery 依赖' : false }, async () => {
+  /** @type {any[]} */
+  const calls = [];
+  const orig = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const u = String(url);
+    calls.push({ url: u, body: JSON.parse(init.body) });
+    if (u.endsWith('/dsh/ask')) {
+      return new Response(JSON.stringify({ ok: true, id: '7' }), { status: 200 });
+    }
+    if (u.endsWith('/dsh/await')) {
+      return new Response(
+        JSON.stringify({ ok: true, status: 'answered', kind: 'approval', outcome: 'rejected' }),
+        { status: 200 },
+      );
+    }
+    return new Response('{"ok":true}', { status: 200 });
+  };
+  try {
+    const b = new BridgeClient({ url: 'http://x', token: 't' });
+    const s = await b.askStart({ toolName: 'fs_write' });
+    assert.equal(s.ok, true);
+    assert.equal(s.id, '7');
+    assert.equal(calls[0].body.kind, 'approval', '要显式声明 kind');
+    const r = await b.awaitResult('7');
+    assert.equal(r.status, 'answered');
+    assert.equal(r.outcome, 'rejected');
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+test('★ v2：免打扰时 askStart 直接给结论、没有编号', { skip: !BridgeClient ? '本机没有 DSH 的 schemastery 依赖' : false }, async () => {
+  const orig = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ ok: true, id: null, outcome: 'allowed-once' }), { status: 200 });
+  try {
+    const b = new BridgeClient({ url: 'http://x', token: 't' });
+    const s = await b.askStart({ toolName: 'fs_write' });
+    assert.equal(s.ok, true);
+    assert.equal(s.id, null);
+    assert.equal(s.outcome, 'allowed-once');
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+test('★ v2：withdraw 带编号与原因', { skip: !BridgeClient ? '本机没有 DSH 的 schemastery 依赖' : false }, async () => {
+  /** @type {any} */
+  let seen = null;
+  const orig = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    seen = { url: String(url), body: JSON.parse(init.body) };
+    return new Response(JSON.stringify({ ok: true, removed: true }), { status: 200 });
+  };
+  try {
+    const b = new BridgeClient({ url: 'http://x', token: 't' });
+    const r = await b.withdraw('7', 'desktop');
+    assert.equal(r.ok, true);
+    assert.equal(r.removed, true);
+    assert.match(seen.url, /\/dsh\/withdraw$/);
+    assert.deepEqual(seen.body, { id: '7', reason: 'desktop' });
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+test('★ v2：await 返回 withdrawn 不算拒绝', { skip: !BridgeClient ? '本机没有 DSH 的 schemastery 依赖' : false }, async () => {
+  const orig = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ ok: true, status: 'withdrawn', reason: 'desktop' }), {
+      status: 200,
+    });
+  try {
+    const b = new BridgeClient({ url: 'http://x', token: 't' });
+    const r = await b.awaitResult('7');
+    assert.equal(r.ok, true);
+    assert.equal(r.status, 'withdrawn');
+    assert.equal(r.outcome, undefined);
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+test('★ v2：await 状态词表外时按失败处理', { skip: !BridgeClient ? '本机没有 DSH 的 schemastery 依赖' : false }, async () => {
+  const orig = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ ok: true, status: '胡说八道' }), { status: 200 });
+  try {
+    const b = new BridgeClient({ url: 'http://x', token: 't' });
+    const r = await b.awaitResult('7');
+    assert.equal(r.ok, false);
+    assert.match(r.error, /无法识别/);
+  } finally {
+    globalThis.fetch = orig;
+  }
 });
